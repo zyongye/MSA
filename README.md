@@ -111,7 +111,7 @@ out, _ = fmha_sm100(
 For block-sparse prefill with CSR metadata, the FP4 indexer, NVFP4 K/V, and
 the paged FP8 decode wrapper, see the **CuTe-DSL deep dive**:
 
-- [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
+- [`python/fmha_sm100/cute/README.md#fp4-indexer-kernel`](python/fmha_sm100/cute/README.md#fp4-indexer-kernel)
 
 ## Test
 

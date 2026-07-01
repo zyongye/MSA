@@ -335,6 +335,57 @@ def _mma_scale_view_to_storage(scale: torch.Tensor) -> torch.Tensor:
     return scale.permute(5, 2, 4, 0, 1, 3)
 
 
+def _page_record_k_and_public_scale_views(
+    k: torch.Tensor,
+    k_scale: torch.Tensor,
+    *,
+    scale_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    page_count, heads_k, page_size, packed_d = (int(v) for v in k.shape)
+    record_bytes = heads_k * page_size * (packed_d + int(scale_groups))
+    backing = torch.empty((page_count, record_bytes), dtype=torch.uint8, device=k.device)
+    backing.zero_()
+    k_view = torch.as_strided(
+        backing,
+        size=tuple(k.shape),
+        stride=(record_bytes, page_size * packed_d, packed_d, 1),
+    )
+    scale_storage_offset = heads_k * page_size * packed_d
+    scale_view = torch.as_strided(
+        backing.view(k_scale.dtype),
+        size=tuple(k_scale.shape),
+        stride=(record_bytes, page_size * scale_groups, scale_groups, 1),
+        storage_offset=scale_storage_offset,
+    )
+    k_view.copy_(k)
+    scale_view.copy_(k_scale)
+    return k_view, scale_view
+
+
+def _page_record_preordered_k_scale_view(
+    k_scale_storage: torch.Tensor,
+    *,
+    page_count: int,
+    heads_k: int,
+    scale_groups: int,
+    packed_d: int = 64,
+    page_size: int = 128,
+) -> torch.Tensor:
+    rest_g = _ceil_div(scale_groups, 4)
+    record_bytes = heads_k * page_size * (packed_d + int(scale_groups))
+    per_head_scale_elems = 512 * rest_g
+    backing = torch.empty((page_count, record_bytes), dtype=torch.uint8, device=k_scale_storage.device)
+    backing.zero_()
+    view = torch.as_strided(
+        backing.view(k_scale_storage.dtype),
+        size=(page_count, heads_k, 1, rest_g, 32, 4, 4),
+        stride=(record_bytes, per_head_scale_elems, per_head_scale_elems, 512, 16, 4, 1),
+        storage_offset=heads_k * page_size * packed_d,
+    )
+    view.copy_(k_scale_storage.view(page_count, heads_k, 1, rest_g, 32, 4, 4))
+    return view
+
+
 @pytest.mark.skipif(not _has_sm100_cuda(), reason="SM100-class CUDA device required")
 @pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
 def test_reorder_scales_for_mma_matches_public_layout(fmt):
@@ -458,6 +509,98 @@ def test_cute_block_scores_random_fp4_matches_reference(
         kv_indices=case["kv_indices"],
         fp4_format=fmt,
         causal=causal,
+        scale_layout=scale_layout,
+    )
+    torch.cuda.synchronize()
+
+    assert tuple(out.shape) == tuple(ref.shape)
+    assert torch.allclose(out.cpu(), ref, atol=_SCORE_ATOL, rtol=_SCORE_RTOL)
+
+
+@pytest.mark.skipif(not _has_sm100_cuda(), reason="SM100-class CUDA device required")
+@pytest.mark.parametrize("fmt", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("scale_layout", ["public", "preordered_mma"])
+def test_cute_block_scores_accepts_page_strided_k(fmt, mode, scale_layout):
+    spec = normalize_fp4_format(fmt)
+    if mode == "decode":
+        case = _make_benchmark_case(
+            fmt=fmt,
+            batch=2,
+            seqlen_q=8,
+            seqlen_k=257,
+            head_kv=2,
+            qhead_per_kv=16,
+            seed=23,
+            shuffle_pages=True,
+            causal=True,
+        )
+        max_seqlen_q = int(case["seqlen_q"])
+        max_seqlen_k = int(case["seqlen_k"])
+    else:
+        case = _make_random_score_case(
+            fmt=fmt,
+            batch=2,
+            max_seqlen=257,
+            heads_q=4,
+            heads_k=2,
+            seed=23,
+        )
+        max_seqlen_q = int(case["max_seqlen"])
+        max_seqlen_k = int(case["max_seqlen"])
+
+    k_strided, k_scale_public_strided = _page_record_k_and_public_scale_views(
+        case["k"],
+        case["k_scale"],
+        scale_groups=spec.scale_groups,
+    )
+    assert not k_strided.is_contiguous()
+    assert not k_scale_public_strided.is_contiguous()
+
+    ref = _reference_block_scores(
+        case["q"].cpu(),
+        case["k"].cpu(),
+        case["q_scale"].cpu(),
+        case["k_scale"].cpu(),
+        case["cu_seqlens_q"].cpu(),
+        case["cu_seqlens_k"].cpu(),
+        case["cu_page_offsets"].cpu(),
+        kv_indices=case["kv_indices"].cpu(),
+        fmt=fmt,
+        causal=True,
+    )
+    q_scale_for_score = case["q_scale"]
+    k_scale_for_score = k_scale_public_strided
+    if scale_layout == "preordered_mma":
+        q_mma, k_mma = fp4_indexer_reorder_scales_for_mma_cute(
+            case["q_scale"],
+            case["k_scale"],
+            fp4_format=fmt,
+        )
+        torch.cuda.synchronize()
+        k_storage = _mma_scale_view_to_storage(k_mma)
+        q_scale_for_score = _mma_scale_view_to_storage(q_mma)
+        k_scale_for_score = _page_record_preordered_k_scale_view(
+            k_storage,
+            page_count=int(case["k"].shape[0]),
+            heads_k=int(case["k"].shape[1]),
+            scale_groups=spec.scale_groups,
+        )
+        assert not k_scale_for_score.is_contiguous()
+
+    out = fp4_indexer_block_scores(
+        case["q"],
+        k_strided,
+        q_scale_for_score,
+        k_scale_for_score,
+        case["cu_seqlens_q"],
+        case["cu_seqlens_k"],
+        case["cu_page_offsets"],
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        kv_indices=case["kv_indices"],
+        fp4_format=fmt,
+        causal=True,
         scale_layout=scale_layout,
     )
     torch.cuda.synchronize()

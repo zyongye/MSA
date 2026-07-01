@@ -107,6 +107,11 @@ def _require_cuda_tensor(tensor: torch.Tensor, *, name: str) -> None:
         raise ValueError(f"{name} must be contiguous")
 
 
+def _require_cuda_tensor_device(tensor: torch.Tensor, *, name: str) -> None:
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+
+
 def _require_int32_vector(tensor: torch.Tensor, *, name: str, device: torch.device) -> None:
     if tensor.device != device:
         raise ValueError(f"{name} must be on the same CUDA device")
@@ -149,6 +154,30 @@ def _as_fp4_paged_hnd_bytes(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
     if tensor.dtype == torch.uint8:
         return tensor
     return tensor.view(torch.uint8)
+
+
+def _k_page_stride_fp4_elems(k_bytes: torch.Tensor, *, heads_k: int) -> int:
+    expected_inner = (
+        _PAGE_SIZE * _FP4_PACKED_D_BYTES,
+        _FP4_PACKED_D_BYTES,
+        1,
+    )
+    actual_inner = tuple(int(v) for v in k_bytes.stride()[1:])
+    if actual_inner != expected_inner:
+        raise ValueError(
+            "k_fp4 must have tightly packed per-page layout [Hk, 128, 64]; "
+            f"expected inner strides {expected_inner}, got {actual_inner}"
+        )
+    page_stride_bytes = int(k_bytes.stride(0))
+    min_page_stride_bytes = int(heads_k) * _PAGE_SIZE * _FP4_PACKED_D_BYTES
+    if page_stride_bytes < min_page_stride_bytes:
+        raise ValueError(
+            "k_fp4 page stride is smaller than one packed page; "
+            f"expected at least {min_page_stride_bytes} bytes, got {page_stride_bytes}"
+        )
+    if page_stride_bytes % 128 != 0:
+        raise ValueError("k_fp4 page stride must be 128B aligned for TMA")
+    return page_stride_bytes * 2
 
 
 def validate_q_scale_thg(
@@ -213,8 +242,24 @@ def validate_k_scale_phsg(
         raise ValueError(f"{name} must have shape {expected}, got {tuple(scale.shape)}")
     if scale.dtype != fmt.torch_scale_dtype:
         raise TypeError(f"{name} must have dtype {fmt.torch_scale_dtype}, got {scale.dtype}")
-    if not scale.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    expected_inner_stride = (_PAGE_SIZE * fmt.scale_groups, fmt.scale_groups, 1)
+    actual_inner_stride = tuple(int(v) for v in scale.stride()[1:])
+    if actual_inner_stride != expected_inner_stride:
+        raise ValueError(
+            f"{name} must have tightly packed per-page scale layout [Hk, 128, G]; "
+            f"expected inner strides {expected_inner_stride}, got {actual_inner_stride}"
+        )
+    min_page_stride = int(heads) * _PAGE_SIZE * fmt.scale_groups
+    if int(scale.stride(0)) < min_page_stride:
+        raise ValueError(
+            f"{name} page stride is smaller than one packed scale page; "
+            f"expected at least {min_page_stride}, got {int(scale.stride(0))}"
+        )
+
+
+def _k_public_scale_page_stride_elems(scale: torch.Tensor, *, heads: int, fmt: Fp4FormatSpec) -> int:
+    validate_k_scale_phsg(scale, name="k_scale", fmt=fmt, page_count=int(scale.shape[0]), heads=heads)
+    return int(scale.stride(0))
 
 
 def fp4_indexer_mma_scale_shape(mn: int, l: int, *, fp4_format: str) -> tuple[int, int, int, int, int, int]:
@@ -285,6 +330,59 @@ def validate_mma_scale_storage(
         raise TypeError(f"{name} must have dtype {fmt.torch_scale_dtype}, got {scale.dtype}")
 
 
+def validate_k_mma_scale_storage(
+    scale: torch.Tensor,
+    *,
+    name: str,
+    fmt: Fp4FormatSpec,
+    page_count: int,
+    heads: int,
+) -> tuple[int, int]:
+    """Validate K preordered MMA scale storage.
+
+    Returns ``(l_extent, page_l_stride)`` for the kernel's logical scale-L
+    coordinate.  The legacy compact layout uses ``L = page * Hk + hk``.  A
+    page-strided 7D layout uses ``L = page * page_l_stride + hk``.
+    """
+
+    rest_g = ceil_div(fmt.scale_groups, 4)
+    per_head_elems = 512 * rest_g
+    if scale.dtype != fmt.torch_scale_dtype:
+        raise TypeError(f"{name} must have dtype {fmt.torch_scale_dtype}, got {scale.dtype}")
+    if scale.ndim == 6:
+        validate_mma_scale_storage(scale, name=name, fmt=fmt, mn=_PAGE_SIZE, l=int(page_count) * int(heads))
+        return int(page_count) * int(heads), int(heads)
+    expected_shape = (int(page_count), int(heads), 1, rest_g, 32, 4, 4)
+    if tuple(scale.shape) != expected_shape:
+        raise ValueError(
+            f"{name} must have MMA storage shape "
+            f"{fp4_indexer_mma_scale_storage_shape(_PAGE_SIZE, int(page_count) * int(heads), fp4_format=fmt.name)} "
+            f"or page-strided shape {expected_shape}, got {tuple(scale.shape)}"
+        )
+    expected_inner_stride = (per_head_elems, per_head_elems, 512, 16, 4, 1)
+    actual_inner_stride = tuple(int(v) for v in scale.stride()[1:])
+    if actual_inner_stride != expected_inner_stride:
+        raise ValueError(
+            f"{name} must have tightly packed per-page MMA scale layout; "
+            f"expected inner strides {expected_inner_stride}, got {actual_inner_stride}"
+        )
+    page_stride = int(scale.stride(0))
+    min_page_stride = int(heads) * per_head_elems
+    if page_stride < min_page_stride:
+        raise ValueError(
+            f"{name} page stride is smaller than one packed MMA scale page; "
+            f"expected at least {min_page_stride}, got {page_stride}"
+        )
+    if page_stride % per_head_elems != 0:
+        raise ValueError(
+            f"{name} page stride must be a multiple of one per-head MMA scale payload "
+            f"({per_head_elems} elements), got {page_stride}"
+        )
+    page_l_stride = page_stride // per_head_elems
+    l_extent = (int(page_count) - 1) * page_l_stride + int(heads) if int(page_count) > 0 else 0
+    return l_extent, page_l_stride
+
+
 def _empty_mma_scale_tensor(
     *,
     mn: int,
@@ -313,7 +411,7 @@ def _compile_fp4_scale_reorder_kernel(
     stream: cuda.CUstream,
 ):
     key = (
-        "fp4_indexer_scale_reorder_sm100_1cta",
+        "fp4_indexer_scale_reorder_sm100_1cta_k_scale_stride",
         fmt.name,
     )
     if key not in _FP4_COMPILE_CACHE:
@@ -359,7 +457,7 @@ def fp4_indexer_reorder_scales_for_mma_cute(
     if q_scale.device != k_scale.device:
         raise ValueError("q_scale and k_scale must be on the same CUDA device")
     _require_cuda_tensor(q_scale, name="q_scale")
-    _require_cuda_tensor(k_scale, name="k_scale")
+    _require_cuda_tensor_device(k_scale, name="k_scale")
     if q_scale.ndim != 3:
         raise ValueError(f"q_scale must have shape [total_q, Hq, G], got {tuple(q_scale.shape)}")
     if k_scale.ndim != 4:
@@ -368,6 +466,7 @@ def fp4_indexer_reorder_scales_for_mma_cute(
     page_count, heads_k, _, _ = (int(v) for v in k_scale.shape)
     validate_q_scale_thg(q_scale, name="q_scale", fmt=spec, total_q=total_q, heads=heads_q)
     validate_k_scale_phsg(k_scale, name="k_scale", fmt=spec, page_count=page_count, heads=heads_k)
+    k_scale_page_stride = _k_public_scale_page_stride_elems(k_scale, heads=heads_k, fmt=spec)
 
     q_scale_mma = _empty_mma_scale_tensor(
         mn=total_q,
@@ -411,6 +510,7 @@ def fp4_indexer_reorder_scales_for_mma_cute(
         Int32(heads_q),
         Int32(page_count),
         Int32(heads_k),
+        Int32(k_scale_page_stride),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q_scale.device).cuda_stream)
     compiled = _compile_fp4_scale_reorder_kernel(
@@ -608,6 +708,9 @@ def _run_fp4_decode_packed_q_scores(
     batch: int,
     max_k_tiles: int,
     total_q: int,
+    k_page_stride_fp4_elems: int,
+    k_scale_l_extent: int,
+    k_scale_page_l_stride: int,
     device_arch: tuple[int, int],
     use_tmem_load_red: bool,
 ) -> None:
@@ -644,6 +747,9 @@ def _run_fp4_decode_packed_q_scores(
         Int32(_HEAD_DIM),
         Int32(batch * heads_k),
         Int32(page_count * heads_k),
+        Int32(k_page_stride_fp4_elems),
+        Int32(k_scale_l_extent),
+        Int32(k_scale_page_l_stride),
         Int32(heads_q),
         Int32(heads_k),
         Int32(batch),
@@ -769,14 +875,17 @@ def fp4_indexer_block_scores(
         128.
     k_fp4 : torch.Tensor
         Packed paged FP4 K tensor with shape ``[total_pages, Hk, 128, 64]``.
+        Each page's ``[Hk, 128, 64]`` payload must be tightly packed; the
+        page stride may be larger than the packed payload size.
     q_scale : torch.Tensor
         Q scale tensor.  With ``scale_layout="public"``, shape is
         ``[total_qo_len, Hq, G]``.  With ``"preordered_mma"``, use
         ``fp4_indexer_reorder_scales_for_mma_cute`` output layout.
     k_scale : torch.Tensor
         K scale tensor.  With ``scale_layout="public"``, shape is
-        ``[total_pages, Hk, 128, G]``.  With ``"preordered_mma"``, use the
-        preordered MMA scale layout.
+        ``[total_pages, Hk, 128, G]`` with a tightly packed per-page payload.
+        With ``"preordered_mma"``, use the preordered MMA scale layout.  K
+        scale may use a larger physical page stride in either layout.
     cu_seqlens_q : torch.Tensor
         Shape ``[batch_size + 1]``, dtype int32.  Prefix sums of Q lengths.
     cu_seqlens_k : torch.Tensor
@@ -823,7 +932,8 @@ def fp4_indexer_block_scores(
     if heads_q % heads_k != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
     _require_cuda_tensor(q_fp4, name="q_fp4")
-    _require_cuda_tensor(k_fp4, name="k_fp4")
+    _require_cuda_tensor_device(k_fp4, name="k_fp4")
+    k_page_stride_fp4_elems = _k_page_stride_fp4_elems(k_bytes, heads_k=heads_k)
     device_arch = _device_arch(q_fp4.device)
     use_tmem_load_red = _supports_tmem_load_red(device_arch)
     _require_int32_vector(cu_seqlens_q, name="cu_seqlens_q", device=q_fp4.device)
@@ -831,12 +941,20 @@ def fp4_indexer_block_scores(
     _require_int32_vector(cu_page_offsets, name="cu_page_offsets", device=q_fp4.device)
     if q_scale.device != q_fp4.device or k_scale.device != q_fp4.device:
         raise ValueError("q_scale and k_scale must be on the same CUDA device as q_fp4")
+    k_scale_l_extent = page_count * heads_k
+    k_scale_page_l_stride = heads_k
     if scale_layout == _PUBLIC_SCALE_LAYOUT:
         validate_q_scale_thg(q_scale, name="q_scale", fmt=spec, total_q=total_q, heads=heads_q)
         validate_k_scale_phsg(k_scale, name="k_scale", fmt=spec, page_count=page_count, heads=heads_k)
     else:
         validate_mma_scale_storage(q_scale, name="q_scale", fmt=spec, mn=total_q, l=heads_q)
-        validate_mma_scale_storage(k_scale, name="k_scale", fmt=spec, mn=_PAGE_SIZE, l=page_count * heads_k)
+        k_scale_l_extent, k_scale_page_l_stride = validate_k_mma_scale_storage(
+            k_scale,
+            name="k_scale",
+            fmt=spec,
+            page_count=page_count,
+            heads=heads_k,
+        )
     batch = int(cu_seqlens_q.shape[0]) - 1
     if batch < 0:
         raise ValueError("cu_seqlens_q must have shape [B + 1]")
@@ -926,6 +1044,9 @@ def fp4_indexer_block_scores(
             batch=batch,
             max_k_tiles=max_k_tiles,
             total_q=total_q,
+            k_page_stride_fp4_elems=k_page_stride_fp4_elems,
+            k_scale_l_extent=k_scale_l_extent,
+            k_scale_page_l_stride=k_scale_page_l_stride,
             device_arch=device_arch,
             use_tmem_load_red=use_tmem_load_red,
         )
@@ -1010,6 +1131,9 @@ def fp4_indexer_block_scores(
         Int32(_HEAD_DIM),
         Int32(batch * heads_q),
         Int32(page_count * heads_k),
+        Int32(k_page_stride_fp4_elems),
+        Int32(k_scale_l_extent),
+        Int32(k_scale_page_l_stride),
         Int32(heads_q),
         Int32(heads_k),
         Int32(batch),

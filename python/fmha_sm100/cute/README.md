@@ -289,7 +289,9 @@ scores = fp4_indexer_block_scores(
 
 - `q_fp4`: `[total_q, Hq, 64]` packed FP4 bytes. Logical head dimension is
   `D=128`, packed as two FP4 values per byte.
-- `k_fp4`: `[total_pages, Hkv, 128, 64]` packed paged-K FP4 bytes.
+- `k_fp4`: `[total_pages, Hkv, 128, 64]` packed paged-K FP4 bytes. The
+  `[Hkv, 128, 64]` payload inside each physical page must be tightly packed,
+  but physical pages may use a larger page stride.
 - `cu_seqlens_q`, `cu_seqlens_k`: `[B + 1]`, CUDA `torch.int32`.
 - `cu_page_offsets`: `[B + 1]`, CUDA `torch.int32` prefix sums over the
   per-batch page counts.
@@ -302,8 +304,9 @@ scores = fp4_indexer_block_scores(
 
 `q_fp4` and `k_fp4` may use `torch.uint8`, `torch.int8`, or
 `torch.float4_e2m1fn_x2` packed storage. `Hq` must be divisible by `Hkv`.
-Packed FP4 tensors must be CUDA tensors, contiguous in the expected layout, and
-128-byte aligned for the TMA paths.
+Packed FP4 tensors must be CUDA tensors. Q must be contiguous in the expected
+layout. K may be either contiguous or page-strided; its page payload and page
+stride must be 128-byte aligned for the TMA paths.
 
 ### FP4 Scale Layouts
 
@@ -314,7 +317,10 @@ uses `torch.float8_e4m3fn`.
 and K scale tensors already stored in the contiguous MMA storage layout
 `(L, restM, restG, 32, 4, 4)` with element stride
 `(512*restM*restG, 512*restG, 512, 16, 4, 1)`. For Q, `mn=total_q` and
-`L=Hq`; for K, `mn=128` and `L=total_pages * Hkv`.
+`L=Hq`; for K, `mn=128` and `L=total_pages * Hkv`. K scale may also be
+passed as a page-strided MMA storage view
+`[total_pages, Hkv, 1, restG, 32, 4, 4]`, where each page/head payload is
+tightly packed and the page stride may include per-page record padding.
 
 `scale_layout="public"` is intended for validation and integration bring-up.
 It accepts public scale tensors:
@@ -322,8 +328,192 @@ It accepts public scale tensors:
 - Q scale: `[total_q, Hq, G]`
 - K scale: `[total_pages, Hkv, 128, G]`
 
-This layout is easier to construct, but the interface must launch the
-standalone scale reorder kernel before the score kernel.
+The K scale page payload must be tightly packed, but physical pages may use a
+larger page stride. This layout is easier to construct, but the interface must
+launch the standalone scale reorder kernel before the score kernel.
+
+### FP4 Indexer Usage Guide
+
+Use the indexer when you need dense QK block scores to choose sparse KV pages.
+The function only produces scores; keep top-k selection, q2k/q2k-to-k2q CSR
+construction, schedule construction, and attention execution as separate
+caller-owned steps.
+
+For an installed package, import the public shim:
+
+```python
+from fmha_sm100.sparse import fp4_indexer_block_scores
+```
+
+For in-tree CuTe debugging, import the local interface directly:
+
+```python
+from fp4_indexer_interface import fp4_indexer_block_scores
+```
+
+The normal setup is:
+
+1. Quantize Q and K to packed FP4 with logical head dimension `D=128`.
+2. Store K as 128-token physical pages.
+3. Build CUDA `int32` prefix-sum metadata for Q lengths, K lengths, and page
+   counts.
+4. Pass `kv_indices`, the logical-to-physical page map.
+5. Run `fp4_indexer_block_scores`.
+6. Run top-k over the returned block scores.
+
+For a single contiguous KV cache with `k_len` tokens:
+
+```python
+import math
+import torch
+
+P = math.ceil(k_len / 128)
+
+cu_seqlens_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+cu_seqlens_k = torch.tensor([0, k_len], device="cuda", dtype=torch.int32)
+cu_page_offsets = torch.tensor([0, P], device="cuda", dtype=torch.int32)
+kv_indices = torch.arange(P, device="cuda", dtype=torch.int32)
+```
+
+The simplest K layout is separate contiguous K and K-scale pools:
+
+```python
+# Packed K bytes. Last dim stores 128 FP4 values as 64 bytes.
+k_fp4 = torch.empty((P, Hkv, 128, 64), device="cuda", dtype=torch.uint8)
+
+# Public scale layout. G is 4 for MXFP4 and 8 for NVFP4.
+k_scale_public = torch.empty((P, Hkv, 128, G), device="cuda", dtype=scale_dtype)
+```
+
+Then run the validation-friendly path:
+
+```python
+scores = fp4_indexer_block_scores(
+    q_fp4,
+    k_fp4,
+    q_scale_public,
+    k_scale_public,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    cu_page_offsets,
+    max_seqlen_q=q_len,
+    max_seqlen_k=k_len,
+    kv_indices=kv_indices,
+    fp4_format="nvfp4",        # or "mxfp4"
+    causal=True,
+    scale_layout="public",    # launches the scale reorder kernel
+)
+```
+
+For the minimum-launch production path, insert scales directly into the
+preordered MMA layout and call with `scale_layout="preordered_mma"`:
+
+```python
+restG = math.ceil(G / 4)
+
+q_scale_mma = torch.empty(
+    (Hq, math.ceil(total_q / 128), restG, 32, 4, 4),
+    device="cuda",
+    dtype=scale_dtype,
+)
+k_scale_mma = torch.empty(
+    (P * Hkv, 1, restG, 32, 4, 4),
+    device="cuda",
+    dtype=scale_dtype,
+)
+
+scores = fp4_indexer_block_scores(
+    q_fp4,
+    k_fp4,
+    q_scale_mma,
+    k_scale_mma,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    cu_page_offsets,
+    max_seqlen_q=max_seqlen_q,
+    max_seqlen_k=max_seqlen_k,
+    kv_indices=kv_indices,
+    fp4_format="nvfp4",
+    causal=True,
+    scale_layout="preordered_mma",
+)
+```
+
+When inserting one public K scale value into `k_scale_mma`, use:
+
+```python
+l = page * Hkv + hkv
+rest_g = group // 4
+group_in_rest = group % 4
+row_atom = row % 32
+row_major = row // 32
+
+k_scale_mma[l, 0, rest_g, row_atom, row_major, group_in_rest] = scale
+```
+
+#### Page-Record K And K-Scale Layout
+
+The indexer also accepts a single backing allocation per physical page, as long
+as the K payload and the K-scale payload are each tightly packed inside the
+page record. This is useful when the KV cache insertion path naturally writes
+one self-contained page record:
+
+```text
+page record:
+  K bytes:     Hkv * 128 * 64
+  scale bytes: Hkv * 128 * G
+```
+
+Expose the K payload as a page-strided view:
+
+```python
+record_bytes = Hkv * 128 * (64 + G)
+backing = torch.empty((P, record_bytes), device="cuda", dtype=torch.uint8)
+
+k_fp4 = torch.as_strided(
+    backing,
+    size=(P, Hkv, 128, 64),
+    stride=(record_bytes, 128 * 64, 64, 1),
+)
+```
+
+For `scale_layout="public"`, expose the scale tail as:
+
+```python
+k_scale_public = torch.as_strided(
+    backing.view(scale_dtype),
+    size=(P, Hkv, 128, G),
+    stride=(record_bytes, 128 * G, G, 1),
+    storage_offset=Hkv * 128 * 64,
+)
+```
+
+For `scale_layout="preordered_mma"`, store each page/head scale payload in MMA
+order inside the scale tail and expose it as:
+
+```python
+restG = math.ceil(G / 4)
+per_head_scale_elems = 512 * restG
+
+k_scale_mma = torch.as_strided(
+    backing.view(scale_dtype),
+    size=(P, Hkv, 1, restG, 32, 4, 4),
+    stride=(
+        record_bytes,
+        per_head_scale_elems,
+        per_head_scale_elems,
+        512,
+        16,
+        4,
+        1,
+    ),
+    storage_offset=Hkv * 128 * 64,
+)
+```
+
+This page-record layout is accepted for K and K scale only. Q and Q scale still
+use their existing contiguous layouts. K page starts must remain 128-byte
+aligned for the TMA loads.
 
 ### FP4 Score Computation
 

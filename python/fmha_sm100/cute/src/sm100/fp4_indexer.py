@@ -100,7 +100,7 @@ class Fp4IndexerScaleReorderSm100:
         problem_size: tuple,
         stream: cuda.CUstream,
     ):
-        total_q, heads_q, page_count, heads_k = problem_size
+        total_q, heads_q, page_count, heads_k, k_scale_page_stride = problem_size
         rest_q_m = cute.ceil_div(total_q, 128)
         rest_g = cute.ceil_div(self.scale_groups, 4)
         k_l = page_count * heads_k
@@ -117,7 +117,7 @@ class Fp4IndexerScaleReorderSm100:
             cute.make_layout(
                 (page_count, heads_k, _PAGE_SIZE, self.scale_groups),
                 stride=(
-                    heads_k * _PAGE_SIZE * self.scale_groups,
+                    k_scale_page_stride,
                     _PAGE_SIZE * self.scale_groups,
                     self.scale_groups,
                     1,
@@ -254,6 +254,9 @@ class Fp4IndexerStagedMmaSm100:
             k,
             _,
             lk,
+            k_page_stride_fp4_elems,
+            k_scale_l_extent,
+            k_scale_page_l_stride,
             heads_q,
             heads_k,
             batch,
@@ -277,7 +280,7 @@ class Fp4IndexerStagedMmaSm100:
             cute.recast_ptr(k_ptr, dtype=_AB_DTYPE),
             cute.make_layout(
                 (_PAGE_SIZE, _HEAD_DIM, heads_k, page_count),
-                stride=(_HEAD_DIM, 1, _PAGE_SIZE * _HEAD_DIM, heads_k * _PAGE_SIZE * _HEAD_DIM),
+                stride=(_HEAD_DIM, 1, _PAGE_SIZE * _HEAD_DIM, k_page_stride_fp4_elems),
             ),
         )
         q_scale_tensor = cute.make_tensor(
@@ -290,7 +293,7 @@ class Fp4IndexerStagedMmaSm100:
         k_scale_tensor = cute.make_tensor(
             k_scale_ptr,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (_PAGE_SIZE, _HEAD_DIM, page_count * heads_k),
+                (_PAGE_SIZE, _HEAD_DIM, k_scale_l_extent),
                 self.sf_vec_size,
             ),
         )
@@ -406,6 +409,7 @@ class Fp4IndexerStagedMmaSm100:
             has_qo_offset,
             max_k_tiles,
             grid_k_groups,
+            k_scale_page_l_stride,
         ).launch(
             grid=(grid_x, batch * heads_q, 1),
             block=[self.threads_per_cta, 1, 1],
@@ -504,6 +508,7 @@ class Fp4IndexerStagedMmaSm100:
         has_qo_offset: Int32,
         max_k_tiles: Int32,
         k_group_count: Int32,
+        k_scale_page_l_stride: Int32,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -900,7 +905,7 @@ class Fp4IndexerStagedMmaSm100:
                             tKsK_tma[(None, k_pair_empty.index)],
                             tma_bar_ptr=k_pair_empty.barrier,
                         )
-                        scale_l = physical_page * heads_k + hk
+                        scale_l = physical_page * k_scale_page_l_stride + hk
                         cute.copy(
                             tma_ks.atom,
                             tKgKS_tma[(None, 0, 0, scale_l)],
@@ -929,7 +934,7 @@ class Fp4IndexerStagedMmaSm100:
                                     tKsK_tma[(None, k_pair_empty.index)],
                                     tma_bar_ptr=k_pair_empty.barrier,
                                 )
-                                scale_l = physical_page * heads_k + hk
+                                scale_l = physical_page * k_scale_page_l_stride + hk
                                 cute.copy(
                                     tma_ks.atom,
                                     tKgKS_tma[(None, 0, 0, scale_l)],
@@ -1274,6 +1279,9 @@ class Fp4IndexerDecodePackedQSm100:
             _,
             _,
             lk,
+            k_page_stride_fp4_elems,
+            k_scale_l_extent,
+            k_scale_page_l_stride,
             heads_q,
             heads_k,
             batch,
@@ -1294,7 +1302,7 @@ class Fp4IndexerDecodePackedQSm100:
             cute.recast_ptr(k_ptr, dtype=_AB_DTYPE),
             cute.make_layout(
                 (_PAGE_SIZE, _HEAD_DIM, heads_k, page_count),
-                stride=(_HEAD_DIM, 1, _PAGE_SIZE * _HEAD_DIM, heads_k * _PAGE_SIZE * _HEAD_DIM),
+                stride=(_HEAD_DIM, 1, _PAGE_SIZE * _HEAD_DIM, k_page_stride_fp4_elems),
             ),
         )
         q_scale_tensor = cute.make_tensor(
@@ -1307,7 +1315,7 @@ class Fp4IndexerDecodePackedQSm100:
         k_scale_tensor = cute.make_tensor(
             k_scale_ptr,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (_PAGE_SIZE, _HEAD_DIM, page_count * heads_k),
+                (_PAGE_SIZE, _HEAD_DIM, k_scale_l_extent),
                 self.sf_vec_size,
             ),
         )
@@ -1415,6 +1423,7 @@ class Fp4IndexerDecodePackedQSm100:
             batch,
             has_qo_offset,
             max_k_tiles,
+            k_scale_page_l_stride,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1495,6 +1504,7 @@ class Fp4IndexerDecodePackedQSm100:
         batch: Int32,
         has_qo_offset: Int32,
         max_k_tiles: Int32,
+        k_scale_page_l_stride: Int32,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -1711,7 +1721,7 @@ class Fp4IndexerDecodePackedQSm100:
                             tKsK_tma[(None, k_pair_empty.index)],
                             tma_bar_ptr=k_pair_empty.barrier,
                         )
-                        scale_l = physical_page * heads_k + hk
+                        scale_l = physical_page * k_scale_page_l_stride + hk
                         cute.copy(
                             tma_ks.atom,
                             tKgKS_tma[(None, 0, 0, scale_l)],
@@ -1738,7 +1748,7 @@ class Fp4IndexerDecodePackedQSm100:
                                     tKsK_tma[(None, k_pair_empty.index)],
                                     tma_bar_ptr=k_pair_empty.barrier,
                                 )
-                                scale_l = physical_page * heads_k + hk
+                                scale_l = physical_page * k_scale_page_l_stride + hk
                                 cute.copy(
                                     tma_ks.atom,
                                     tKgKS_tma[(None, 0, 0, scale_l)],
