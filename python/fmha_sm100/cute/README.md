@@ -299,7 +299,8 @@ scores = fp4_indexer_block_scores(
   indices in the same order described by `cu_page_offsets`.
 - `fp4_format`: `"mxfp4"` or `"nvfp4"`. MXFP4 uses `G=4` scale groups;
   NVFP4 uses `G=8`.
-- `scores`: `[Hq, ceil(max_seqlen_k / 128), total_q]`, `torch.float32`.
+- `scores`: `[total_q, Hq, ceil(max_seqlen_k / 128)]`, `torch.float32`.
+  The final dimension is the logical KV-block dimension used for top-k.
   Invalid, out-of-range, or causally masked blocks are written as `-inf`.
 
 `q_fp4` and `k_fp4` may use `torch.uint8`, `torch.int8`, or
@@ -359,7 +360,7 @@ The normal setup is:
    counts.
 4. Pass `kv_indices`, the logical-to-physical page map.
 5. Run `fp4_indexer_block_scores`.
-6. Run top-k over the returned block scores.
+6. Run top-k over the final dimension of the returned block scores.
 
 For a single contiguous KV cache with `k_len` tokens:
 
@@ -403,6 +404,10 @@ scores = fp4_indexer_block_scores(
     causal=True,
     scale_layout="public",    # launches the scale reorder kernel
 )
+
+topk_scores, topk_pages = torch.topk(scores, k=topk, dim=-1)
+# scores layout: [total_q, Hq, K]
+# topk_pages layout: [total_q, Hq, topk]
 ```
 
 For the minimum-launch production path, insert scales directly into the
@@ -521,7 +526,7 @@ For each batch item, query token, query head, and 128-token KV block, the
 kernel computes:
 
 ```text
-scores[hq, k_block, q_global] =
+scores[q_global, hq, k_block] =
     max(dot(dequant_fp4(q[q_global, hq]), dequant_fp4(k[k_token, hkv])))
 ```
 

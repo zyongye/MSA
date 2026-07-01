@@ -299,7 +299,7 @@ def _reference_block_scores(
     max_k_tiles = max(_ceil_div(int(k_prefix[b + 1].item() - k_prefix[b].item()), 128) for b in range(batch))
     kv_indices_cpu = kv_indices.cpu()
     qo_offset_cpu = qo_offset.cpu() if qo_offset is not None else None
-    scores = torch.full((heads_q, max_k_tiles, total_q), float("-inf"), dtype=torch.float32)
+    scores = torch.full((total_q, heads_q, max_k_tiles), float("-inf"), dtype=torch.float32)
 
     for b in range(batch):
         q_begin = int(q_prefix[b].item())
@@ -323,7 +323,7 @@ def _reference_block_scores(
                         if not bool(visible.any()):
                             continue
                         logits = logits.masked_fill(~visible, float("-inf"))
-                    scores[hq, ktile, q_abs] = logits.max()
+                    scores[q_abs, hq, ktile] = logits.max()
     return scores
 
 

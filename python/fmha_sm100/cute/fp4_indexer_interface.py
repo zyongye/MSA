@@ -915,7 +915,7 @@ def fp4_indexer_block_scores(
     Returns
     -------
     torch.Tensor
-        Shape ``[Hq, ceil(max_seqlen_k / 128), total_qo_len]``, dtype float32.
+        Shape ``[total_qo_len, Hq, ceil(max_seqlen_k / 128)]``, dtype float32.
         Entries beyond the valid KV page range are ``-inf``.
     """
 
@@ -983,14 +983,14 @@ def fp4_indexer_block_scores(
     n_aligned = max_k_tiles * _PAGE_SIZE
     if max_k_tiles == 0:
         return torch.full(
-            (heads_q, 0, total_q),
+            (total_q, heads_q, 0),
             float("-inf"),
             dtype=torch.float32,
             device=q_fp4.device,
         )
 
     scores = torch.empty(
-        (heads_q, max_k_tiles, total_q),
+        (total_q, heads_q, max_k_tiles),
         dtype=torch.float32,
         device=q_fp4.device,
     )

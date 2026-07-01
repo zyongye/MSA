@@ -299,7 +299,7 @@ class Fp4IndexerStagedMmaSm100:
         )
         scores_tensor = cute.make_tensor(
             scores_ptr,
-            cute.make_layout((heads_q, max_k_tiles, total_q), stride=(max_k_tiles * total_q, total_q, 1)),
+            cute.make_layout((total_q, heads_q, max_k_tiles), stride=(heads_q * max_k_tiles, max_k_tiles, 1)),
         )
         kv_indices_tensor = cute.make_tensor(
             kv_indices_ptr,
@@ -1081,14 +1081,14 @@ class Fp4IndexerStagedMmaSm100:
                                                 ):
                                                     row_max1 = cute.arch.fmax(row_max1, tTR_rAcc[i])
                                 if q_tile_full:
-                                    mScores[hq, ktile, q_global_store0] = row_max0
+                                    mScores[q_global_store0, hq, ktile] = row_max0
                                 elif q_local_store0 < q_len:
-                                    mScores[hq, ktile, q_global_store0] = row_max0
+                                    mScores[q_global_store0, hq, ktile] = row_max0
                                 if const_expr(self.cta_tile_shape_mnk[0] > self.epi_threads_per_cta):
                                     if q_tile_full:
-                                        mScores[hq, ktile, q_global_store1] = row_max1
+                                        mScores[q_global_store1, hq, ktile] = row_max1
                                     elif q_local_store1 < q_len:
-                                        mScores[hq, ktile, q_global_store1] = row_max1
+                                        mScores[q_global_store1, hq, ktile] = row_max1
                                 cute.arch.fence_view_async_tmem_load()
                                 acc_pipeline.consumer_release_w_index(acc_stage_index)
                             visible_tile_count += Int32(1)
@@ -1096,9 +1096,9 @@ class Fp4IndexerStagedMmaSm100:
                             if const_expr(not self.compact_schedule):
                                 if epi_warpgroup_idx == Int32(0):
                                     if q_tile_full:
-                                        mScores[hq, ktile, q_global_store0] = -Float32.inf
+                                        mScores[q_global_store0, hq, ktile] = -Float32.inf
                                     elif q_local_store0 < q_len:
-                                        mScores[hq, ktile, q_global_store0] = -Float32.inf
+                                        mScores[q_global_store0, hq, ktile] = -Float32.inf
             else:
                 if const_expr(not self.compact_schedule):
                     if epi_warpgroup_idx == Int32(0):
@@ -1106,9 +1106,9 @@ class Fp4IndexerStagedMmaSm100:
                             ktile = ktile_group * Int32(self.k_tiles_per_cta) + Int32(ktile_inner)
                             if ktile < max_k_tiles:
                                 if q_tile_full:
-                                    mScores[hq, ktile, q_global_store0] = -Float32.inf
+                                    mScores[q_global_store0, hq, ktile] = -Float32.inf
                                 elif q_local_store0 < q_len:
-                                    mScores[hq, ktile, q_global_store0] = -Float32.inf
+                                    mScores[q_global_store0, hq, ktile] = -Float32.inf
             cute.arch.barrier()
             tmem.free(tmem_pool.base_ptr)
 
@@ -1321,7 +1321,7 @@ class Fp4IndexerDecodePackedQSm100:
         )
         scores_tensor = cute.make_tensor(
             scores_ptr,
-            cute.make_layout((heads_q, max_k_tiles, total_q), stride=(max_k_tiles * total_q, total_q, 1)),
+            cute.make_layout((total_q, heads_q, max_k_tiles), stride=(heads_q * max_k_tiles, max_k_tiles, 1)),
         )
         kv_indices_tensor = cute.make_tensor(kv_indices_ptr, cute.make_layout((page_count,), stride=(1,)))
         cu_layout = cute.make_layout((batch + 1,), stride=(1,))
@@ -1945,7 +1945,7 @@ class Fp4IndexerDecodePackedQSm100:
                                         if valid:
                                             row_max0 = cute.arch.fmax(row_max0, tTR_rAcc[i])
                                 if h_store < qhead_per_kv and q_local_store < q_len:
-                                    mScores[h_global_store, ktile, q_global_store] = row_max0
+                                    mScores[q_global_store, h_global_store, ktile] = row_max0
                                 cute.arch.fence_view_async_tmem_load()
                                 acc_pipeline.consumer_release_w_index(acc_stage_index)
                             visible_tile_count += Int32(1)
@@ -1953,7 +1953,7 @@ class Fp4IndexerDecodePackedQSm100:
                             if const_expr(not self.compact_schedule):
                                 if epi_warpgroup_idx == Int32(0):
                                     if h_store < qhead_per_kv and q_local_store < q_len:
-                                        mScores[h_global_store, ktile, q_global_store] = -Float32.inf
+                                        mScores[q_global_store, h_global_store, ktile] = -Float32.inf
             else:
                 if const_expr(not self.compact_schedule):
                     if epi_warpgroup_idx == Int32(0):
@@ -1961,6 +1961,6 @@ class Fp4IndexerDecodePackedQSm100:
                             ktile = group_first_ktile + Int32(ktile_inner)
                             if ktile < max_k_tiles:
                                 if h_store < qhead_per_kv and q_local_store < q_len:
-                                    mScores[h_global_store, ktile, q_global_store] = -Float32.inf
+                                    mScores[q_global_store, h_global_store, ktile] = -Float32.inf
             cute.arch.barrier()
             tmem.free(tmem_pool.base_ptr)
