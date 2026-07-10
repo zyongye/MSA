@@ -105,6 +105,122 @@ __device__ __forceinline__ int32_t GatherBlockTableValue(
   return __ldg(block_table_row + static_cast<size_t>(logical_idx) * block_table_stride_k);
 }
 
+__device__ __forceinline__ void WriteTrtllmFlatBlockTableRow(
+    const int32_t* __restrict__ sorted_indices, int range_valid_count,
+    int32_t* __restrict__ row_out, uint64_t out_stride_k,
+    const int32_t* __restrict__ block_table, uint64_t block_table_stride_b,
+    uint64_t block_table_stride_k, const int32_t* __restrict__ seq_lens,
+    uint32_t t, uint32_t h, uint32_t topK, uint32_t row_num_valid_pages,
+    uint32_t block_table_num_blocks, uint32_t num_kv_heads, uint32_t block_size,
+    uint32_t decode_query_len) {
+  if (block_table == nullptr || seq_lens == nullptr || block_size == 0 || decode_query_len == 0) {
+    return;
+  }
+
+  const uint32_t req = t / decode_query_len;
+  const uint32_t q_off = t - req * decode_query_len;
+  const int32_t seq_len = __ldg(seq_lens + req);
+  int32_t query_pos = seq_len - static_cast<int32_t>(decode_query_len) + static_cast<int32_t>(q_off);
+  query_pos = query_pos > 0 ? query_pos : 0;
+  const int32_t local_block = query_pos / static_cast<int32_t>(block_size);
+  const int32_t* bt_row = block_table + static_cast<size_t>(req) * block_table_stride_b;
+
+  int cursor = 0;
+  int32_t local_page = 0;
+  int has_local = 0;
+  int32_t first_page = 0;
+  int has_any = 0;
+
+  for (uint32_t j = 0; j < topK; ++j) {
+    const int32_t blk =
+        sorted_indices == nullptr
+            ? ((static_cast<int>(j) < range_valid_count) ? static_cast<int32_t>(j) : -1)
+            : sorted_indices[j];
+    const bool valid = (blk >= 0) &&
+                       (static_cast<uint32_t>(blk) < row_num_valid_pages) &&
+                       (static_cast<uint32_t>(blk) < block_table_num_blocks);
+    if (valid) {
+      const int32_t page = __ldg(bt_row + static_cast<size_t>(blk) * block_table_stride_k);
+      const int32_t effective_page = page * static_cast<int32_t>(num_kv_heads) +
+                                     static_cast<int32_t>(h);
+      if (has_any == 0) {
+        first_page = effective_page;
+        has_any = 1;
+      }
+      if (blk == local_block) {
+        local_page = effective_page;
+        has_local = 1;
+      } else {
+        row_out[static_cast<size_t>(cursor) * out_stride_k] = effective_page;
+        cursor += 1;
+      }
+    }
+  }
+
+  if (has_local == 1) {
+    row_out[static_cast<size_t>(cursor) * out_stride_k] = local_page;
+    cursor += 1;
+  }
+
+  const int32_t fill = has_any == 1 ? first_page : 0;
+  for (uint32_t j = static_cast<uint32_t>(cursor); j < topK; ++j) {
+    row_out[static_cast<size_t>(j) * out_stride_k] = fill;
+  }
+}
+
+__device__ __forceinline__ void WriteTrtllmFlatBlockTableWarp(
+    uint32_t logical_key, uint32_t lane, int32_t* __restrict__ row_out,
+    uint64_t out_stride_k, const int32_t* __restrict__ block_table,
+    uint64_t block_table_stride_b, uint64_t block_table_stride_k,
+    const int32_t* __restrict__ seq_lens, uint32_t t, uint32_t h,
+    uint32_t topK, uint32_t row_num_valid_pages, uint32_t block_table_num_blocks,
+    uint32_t num_kv_heads, uint32_t block_size, uint32_t decode_query_len) {
+  constexpr uint32_t kFullWarpMask = 0xffffffffu;
+  const uint32_t req = t / decode_query_len;
+  const uint32_t q_off = t - req * decode_query_len;
+
+  int32_t local_block = 0;
+  if (lane == 0) {
+    const int32_t seq_len = __ldg(seq_lens + req);
+    int32_t query_pos =
+        seq_len - static_cast<int32_t>(decode_query_len) + static_cast<int32_t>(q_off);
+    query_pos = query_pos > 0 ? query_pos : 0;
+    local_block = query_pos / static_cast<int32_t>(block_size);
+  }
+  local_block = __shfl_sync(kFullWarpMask, local_block, 0);
+
+  const bool valid = logical_key != ~0u && logical_key < row_num_valid_pages &&
+                     logical_key < block_table_num_blocks;
+  const int32_t blk = valid ? static_cast<int32_t>(logical_key) : -1;
+  const bool is_local = valid && blk == local_block;
+  int32_t effective_page = 0;
+  if (valid) {
+    const int32_t* bt_row = block_table + static_cast<size_t>(req) * block_table_stride_b;
+    const int32_t page = __ldg(bt_row + static_cast<size_t>(blk) * block_table_stride_k);
+    effective_page = page * static_cast<int32_t>(num_kv_heads) + static_cast<int32_t>(h);
+  }
+
+  const uint32_t valid_mask = __ballot_sync(kFullWarpMask, valid);
+  const uint32_t non_local_mask = __ballot_sync(kFullWarpMask, valid && !is_local);
+  const uint32_t lower_lane_mask = lane == 0 ? 0u : ((1u << lane) - 1u);
+  const int non_local_rank = __popc(non_local_mask & lower_lane_mask);
+  const int num_non_local = __popc(non_local_mask);
+  const int num_valid = __popc(valid_mask);
+
+  if (valid && !is_local) {
+    row_out[static_cast<size_t>(non_local_rank) * out_stride_k] = effective_page;
+  } else if (is_local) {
+    row_out[static_cast<size_t>(num_non_local) * out_stride_k] = effective_page;
+  }
+
+  const int first_valid_lane = valid_mask == 0 ? 0 : (__ffs(valid_mask) - 1);
+  const int32_t first_page =
+      valid_mask == 0 ? 0 : __shfl_sync(kFullWarpMask, effective_page, first_valid_lane);
+  if (lane >= static_cast<uint32_t>(num_valid) && lane < topK) {
+    row_out[static_cast<size_t>(lane) * out_stride_k] = first_page;
+  }
+}
+
 // =============================================================================
 // v2.0 design overview
 // =============================================================================
@@ -130,7 +246,10 @@ __device__ __forceinline__ int32_t GatherBlockTableValue(
 //          |
 //   [out (qo, num_qo_heads, topk) int32, ascending-by-index]
 //     If block_table is supplied, selected logical indices are sorted first,
-//     then gathered through block_table[t][h][idx] before the write.
+//     then either gathered through block_table[t][h][idx] before the write
+//     (3D direct mode) or transformed into TRTLLM flat effective pages
+//     block_table[req][idx] * num_kv_heads + h with the local block moved to
+//     the last valid slot (2D flat mode).
 //
 // Trivial path (max_k_tiles <= topk) routes to SparseTopKIdentityFillKernel,
 // same as the v1.6.5 fork — preserves the seamless drop-in contract.
@@ -514,12 +633,17 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
 // max_k_tiles (or any value >= max_k_tiles) to disable clamping.
 __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
                                              const int32_t* __restrict__ block_table,
+                                             const int32_t* __restrict__ seq_lens,
                                              uint64_t out_stride_t,
                                              uint64_t out_stride_h,
                                              uint64_t out_stride_k,
                                              uint64_t block_table_stride_t,
                                              uint64_t block_table_stride_h,
                                              uint64_t block_table_stride_k,
+                                             uint32_t block_table_mode,
+                                             uint32_t block_table_num_blocks,
+                                             uint32_t block_size,
+                                             uint32_t decode_query_len,
                                              uint32_t total_qo_len,
                                              uint32_t num_qo_heads, uint32_t max_k_tiles,
                                              uint32_t topk, uint32_t num_valid_pages,
@@ -547,6 +671,20 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
       LoadRowNumValidPages(num_valid_pages_per_token, t, num_valid_pages);
   const uint32_t valid_count =
       (row_num_valid_pages < max_k_tiles) ? row_num_valid_pages : max_k_tiles;
+  if (block_table_mode == 2) {
+    if (tx == 0) {
+      WriteTrtllmFlatBlockTableRow(
+          nullptr, static_cast<int>(valid_count), row, out_stride_k, block_table,
+          block_table_stride_t, block_table_stride_k, seq_lens, t, qo_head_idx, topk,
+          row_num_valid_pages, block_table_num_blocks, num_qo_heads, block_size,
+          decode_query_len);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      SparseTopKLaunchDependentGrids(use_pdl);
+    }
+    return;
+  }
   for (uint32_t i = tx; i < topk; i += blockDim.x) {
     const int32_t logical_idx = (i < valid_count) ? static_cast<int32_t>(i) : -1;
     row[static_cast<size_t>(i) * out_stride_k] =
@@ -675,9 +813,12 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     const float* __restrict__ in,        // row-contig fp32: (H, T, K) or (T, H, K)
     int32_t* __restrict__ out,           // (qo, num_qo_heads, topk) logical int32
     const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_lens,
     uint64_t out_stride_t, uint64_t out_stride_h, uint64_t out_stride_k,
     uint64_t block_table_stride_t, uint64_t block_table_stride_h,
     uint64_t block_table_stride_k,
+    uint32_t block_table_mode, uint32_t block_table_num_blocks,
+    uint32_t block_size, uint32_t decode_query_len,
     uint32_t total_qo_len, uint32_t num_qo_heads, uint32_t max_k_tiles,
     uint32_t topk,
     // v2.5_oob_clamp_in_kernel: indices >= num_valid_pages get rewritten to -1
@@ -758,6 +899,19 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     const int valid_count = (row_num_valid_pages < static_cast<uint32_t>(rowLen))
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if (block_table_mode == 2) {
+      if (threadIdx.x == 0) {
+        WriteTrtllmFlatBlockTableRow(
+            nullptr, valid_count, row_out, out_stride_k, block_table, block_table_stride_t,
+            block_table_stride_k, seq_lens, t, qo_head_idx, topk, row_num_valid_pages,
+            block_table_num_blocks, num_qo_heads, block_size, decode_query_len);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        SparseTopKLaunchDependentGrids(use_pdl);
+      }
+      return;
+    }
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -780,6 +934,19 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     const int valid_count = (static_cast<int>(row_num_valid_pages) < rowLen)
                                 ? static_cast<int>(row_num_valid_pages)
                                 : rowLen;
+    if (block_table_mode == 2) {
+      if (threadIdx.x == 0) {
+        WriteTrtllmFlatBlockTableRow(
+            nullptr, valid_count, row_out, out_stride_k, block_table, block_table_stride_t,
+            block_table_stride_k, seq_lens, t, qo_head_idx, topk, row_num_valid_pages,
+            block_table_num_blocks, num_qo_heads, block_size, decode_query_len);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        SparseTopKLaunchDependentGrids(use_pdl);
+      }
+      return;
+    }
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[static_cast<size_t>(rowIt) * out_stride_k] =
           GatherBlockTableValue(block_table_row, block_table_stride_k, rowIt);
@@ -891,6 +1058,13 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       key = valid ? static_cast<uint32_t>(idx) : ~0u;
     }
     WarpBitonicSortAsc32(key, lane);
+    if (block_table_mode == 2) {
+      WriteTrtllmFlatBlockTableWarp(
+          key, lane, row_out, out_stride_k, block_table, block_table_stride_t,
+          block_table_stride_k, seq_lens, t, qo_head_idx, topk, row_num_valid_pages,
+          block_table_num_blocks, num_qo_heads, block_size, decode_query_len);
+      return;
+    }
     if (lane < topK) {
       const int32_t logical_idx = (key == ~0u) ? -1 : static_cast<int32_t>(key);
       row_out[static_cast<size_t>(lane) * out_stride_k] =
@@ -911,6 +1085,24 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       }
     }
     WarpBitonicSortAsc64(keys, lane);
+    if (block_table_mode == 2) {
+#pragma unroll
+      for (int s = 0; s < 2; ++s) {
+        const int pos = static_cast<int>(lane) * 2 + s;
+        if (pos < topK) {
+          const uint32_t k = keys[s];
+          smemOutput[pos] = (k == ~0u) ? -1 : static_cast<int32_t>(k);
+        }
+      }
+      __syncwarp();
+      if (lane == 0) {
+        WriteTrtllmFlatBlockTableRow(
+            smemOutput, -1, row_out, out_stride_k, block_table, block_table_stride_t,
+            block_table_stride_k, seq_lens, t, qo_head_idx, topk, row_num_valid_pages,
+            block_table_num_blocks, num_qo_heads, block_size, decode_query_len);
+      }
+      return;
+    }
 #pragma unroll
     for (int s = 0; s < 2; ++s) {
       const int pos = static_cast<int>(lane) * 2 + s;
@@ -968,11 +1160,16 @@ inline cudaError_t LaunchSparseTopKKernel(const void* kernel, dim3 grid, dim3 bl
 
 cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
                               const int32_t* block_table,
+                              const int32_t* seq_lens,
                               uint64_t out_stride_t, uint64_t out_stride_h,
                               uint64_t out_stride_k,
                               uint64_t block_table_stride_t,
                               uint64_t block_table_stride_h,
                               uint64_t block_table_stride_k,
+                              uint32_t block_table_mode,
+                              uint32_t block_table_num_blocks,
+                              uint32_t block_size,
+                              uint32_t decode_query_len,
                               uint32_t total_qo_len, uint32_t num_qo_heads,
                               uint32_t max_k_tiles, uint32_t topk,
                               uint32_t num_valid_pages,
@@ -987,10 +1184,12 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
   const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
   const uint32_t input_qo_outermost_u32 = input_qo_outermost ? 1u : 0u;
   const uint32_t use_pdl = enable_pdl ? 1u : 0u;
-  void* args[] = {(void*)&in_row_contig, (void*)&out, (void*)&block_table,
+  void* args[] = {(void*)&in_row_contig, (void*)&out, (void*)&block_table, (void*)&seq_lens,
                   (void*)&out_stride_t, (void*)&out_stride_h, (void*)&out_stride_k,
                   (void*)&block_table_stride_t, (void*)&block_table_stride_h,
                   (void*)&block_table_stride_k,
+                  (void*)&block_table_mode, (void*)&block_table_num_blocks,
+                  (void*)&block_size, (void*)&decode_query_len,
                   (void*)&total_qo_len,
                   (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
                   (void*)&num_valid_pages, (void*)&num_valid_pages_per_token,
@@ -1004,11 +1203,16 @@ cudaError_t LaunchIndexerTopK(const float* in_row_contig, int32_t* out,
 
 cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transposed, int32_t* out,
                                           const int32_t* block_table,
+                                          const int32_t* seq_lens,
                                           uint64_t out_stride_t, uint64_t out_stride_h,
                                           uint64_t out_stride_k,
                                           uint64_t block_table_stride_t,
                                           uint64_t block_table_stride_h,
                                           uint64_t block_table_stride_k,
+                                          uint32_t block_table_mode,
+                                          uint32_t block_table_num_blocks,
+                                          uint32_t block_size,
+                                          uint32_t decode_query_len,
                                           uint32_t total_qo_len, uint32_t num_qo_heads,
                                           uint32_t max_k_tiles, uint32_t topk,
                                           uint32_t num_valid_pages,
@@ -1052,9 +1256,11 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
   }
 
   // ---- (2) IndexerTopK + fused sort + write to qo_outermost layout -------
-  return LaunchIndexerTopK(transposed, out, block_table,
+  return LaunchIndexerTopK(transposed, out, block_table, seq_lens,
                            out_stride_t, out_stride_h, out_stride_k,
                            block_table_stride_t, block_table_stride_h, block_table_stride_k,
+                           block_table_mode, block_table_num_blocks, block_size,
+                           decode_query_len,
                            total_qo_len, num_qo_heads, max_k_tiles, topk,
                            num_valid_pages, num_valid_pages_per_token,
                            force_begin, force_end,
@@ -1076,9 +1282,10 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 //   in        : (num_qo_heads, max_k_tiles, total_qo_len) contiguous fp32 for kHKT,
 //               or (total_qo_len, num_qo_heads, max_k_tiles) contiguous fp32 for kTHK
 //   out       : (total_qo_len, num_qo_heads, topk=16) int32. Without block_table,
-//               values are logical k_tile indices asc by k_tile index. With
-//               block_table, logical indices are sorted first, then gathered
-//               from block_table[t][h][idx].
+//               values are logical k_tile indices asc by k_tile index. A 3D
+//               block table directly gathers block_table[t][h][idx]. A 2D
+//               block table emits TRTLLM effective pages with local-last and
+//               valid-page padding semantics.
 //   workspace : int32, at least SparseTopKWorkspaceSize(...) elements
 //   num_valid_pages : indices >= num_valid_pages are emitted as -1 (sorted to
 //                     tail).  Pass max_k_tiles (or any value >= max_k_tiles)
@@ -1090,11 +1297,16 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 //   * max_k_tiles >= 12288   → cudaErrorNotSupported
 inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* workspace,
                                     const int32_t* block_table,
+                                    const int32_t* seq_lens,
                                     uint64_t out_stride_t, uint64_t out_stride_h,
                                     uint64_t out_stride_k,
                                     uint64_t block_table_stride_t,
                                     uint64_t block_table_stride_h,
                                     uint64_t block_table_stride_k,
+                                    uint32_t block_table_mode,
+                                    uint32_t block_table_num_blocks,
+                                    uint32_t block_size,
+                                    uint32_t decode_query_len,
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
                                     uint32_t max_k_tiles, uint32_t num_valid_pages,
                                     const int32_t* num_valid_pages_per_token,
@@ -1110,10 +1322,12 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   if (max_k_tiles <= topk) {
     dim3 grid(num_rows);
     dim3 block(topk);
-    void* args[] = {(void*)&out, (void*)&block_table,
+    void* args[] = {(void*)&out, (void*)&block_table, (void*)&seq_lens,
                     (void*)&out_stride_t, (void*)&out_stride_h, (void*)&out_stride_k,
                     (void*)&block_table_stride_t, (void*)&block_table_stride_h,
                     (void*)&block_table_stride_k,
+                    (void*)&block_table_mode, (void*)&block_table_num_blocks,
+                    (void*)&block_size, (void*)&decode_query_len,
                     (void*)&total_qo_len, (void*)&num_qo_heads,
                     (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages,
                     (void*)&num_valid_pages_per_token, (void*)&use_pdl};
@@ -1125,10 +1339,12 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   if (max_k_tiles >= 12288) return cudaErrorNotSupported;
 
   if (input_layout == SparseTopKInputLayout::kTHK) {
-    return LaunchIndexerTopK(in, out, block_table,
+    return LaunchIndexerTopK(in, out, block_table, seq_lens,
                              out_stride_t, out_stride_h, out_stride_k,
                              block_table_stride_t, block_table_stride_h,
                              block_table_stride_k,
+                             block_table_mode, block_table_num_blocks, block_size,
+                             decode_query_len,
                              total_qo_len, num_qo_heads, max_k_tiles, topk,
                              num_valid_pages, num_valid_pages_per_token,
                              force_begin, force_end,
@@ -1136,10 +1352,12 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   }
 
   float* transpose_buf = reinterpret_cast<float*>(workspace);
-  return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, block_table,
+  return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, block_table, seq_lens,
                                        out_stride_t, out_stride_h, out_stride_k,
                                        block_table_stride_t, block_table_stride_h,
                                        block_table_stride_k,
+                                       block_table_mode, block_table_num_blocks,
+                                       block_size, decode_query_len,
                                        total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
                                        num_valid_pages_per_token,

@@ -35,11 +35,14 @@ void sparse_topk_select_init() {
 void sparse_topk_select(TensorView max_score, TensorView output_indices,
                         Optional<TensorView> maybe_workspace_buffer,
                         Optional<TensorView> maybe_block_table,
+                        Optional<TensorView> maybe_seq_lens,
                         int64_t topk,
                         int64_t num_valid_pages,
                         Optional<TensorView> maybe_num_valid_pages_per_token,
                         int64_t force_begin_blocks, int64_t force_end_blocks,
                         int64_t input_layout,
+                        int64_t block_size,
+                        int64_t decode_query_len,
                         int64_t stream_ptr) {
   CHECK_INPUT(max_score);
   CHECK_CUDA(output_indices);
@@ -72,30 +75,74 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       << "num_valid_pages must be > 0, got " << num_valid_pages;
 
   const int32_t* block_table_ptr = nullptr;
+  const int32_t* seq_lens_ptr = nullptr;
   uint64_t block_table_stride_t = 0;
   uint64_t block_table_stride_h = 0;
   uint64_t block_table_stride_k = 0;
+  uint32_t block_table_mode = 0;
+  uint32_t block_table_num_blocks = 0;
+  int64_t block_table_num_reqs = 0;
   if (maybe_block_table.has_value()) {
     TensorView block_table = maybe_block_table.value();
     CHECK_CUDA(block_table);
-    CHECK_DIM(3, block_table);
     TVM_FFI_ICHECK(encode_dlpack_dtype(block_table.dtype()) == int32_code)
         << "block_table must be int32";
-    TVM_FFI_ICHECK(block_table.size(0) == total_qo_len &&
-                   block_table.size(1) == num_qo_heads &&
-                   block_table.size(2) == max_k_tiles)
-        << "block_table must have shape [total_qo_len=" << total_qo_len
-        << ", num_qo_heads=" << num_qo_heads << ", max_k_tiles=" << max_k_tiles
-        << "], got [" << block_table.size(0) << ", " << block_table.size(1)
-        << ", " << block_table.size(2) << "]";
+    TVM_FFI_ICHECK(block_table.ndim() == 2 || block_table.ndim() == 3)
+        << "block_table must be either 2D [num_reqs, max_blocks] or 3D "
+        << "[total_qo_len, num_qo_heads, max_k_tiles], got ndim=" << block_table.ndim();
     TVM_FFI_ICHECK(block_table.stride(0) >= 0 && block_table.stride(1) >= 0 &&
-                   block_table.stride(2) >= 0)
+                   (block_table.ndim() == 2 || block_table.stride(2) >= 0))
         << "block_table must have non-negative strides";
     CHECK_DEVICE(block_table, max_score);
     block_table_ptr = TensorDataPtrConst<int32_t>(block_table);
-    block_table_stride_t = static_cast<uint64_t>(block_table.stride(0));
-    block_table_stride_h = static_cast<uint64_t>(block_table.stride(1));
-    block_table_stride_k = static_cast<uint64_t>(block_table.stride(2));
+    if (block_table.ndim() == 3) {
+      TVM_FFI_ICHECK(block_table.size(0) == total_qo_len &&
+                     block_table.size(1) == num_qo_heads &&
+                     block_table.size(2) == max_k_tiles)
+          << "3D block_table must have shape [total_qo_len=" << total_qo_len
+          << ", num_qo_heads=" << num_qo_heads << ", max_k_tiles=" << max_k_tiles
+          << "], got [" << block_table.size(0) << ", " << block_table.size(1)
+          << ", " << block_table.size(2) << "]";
+      block_table_mode = 1;
+      block_table_num_blocks = static_cast<uint32_t>(block_table.size(2));
+      block_table_stride_t = static_cast<uint64_t>(block_table.stride(0));
+      block_table_stride_h = static_cast<uint64_t>(block_table.stride(1));
+      block_table_stride_k = static_cast<uint64_t>(block_table.stride(2));
+    } else {
+      TVM_FFI_ICHECK(maybe_seq_lens.has_value())
+          << "seq_lens is required for 2D block_table TRTLLM flat mode";
+      TVM_FFI_ICHECK(block_size > 0) << "block_size must be > 0 for 2D block_table";
+      TVM_FFI_ICHECK(decode_query_len > 0)
+          << "decode_query_len must be > 0 for 2D block_table";
+      TVM_FFI_ICHECK(total_qo_len % decode_query_len == 0)
+          << "total_qo_len=" << total_qo_len
+          << " must be divisible by decode_query_len=" << decode_query_len;
+      const int64_t num_reqs = total_qo_len / decode_query_len;
+      TVM_FFI_ICHECK(block_table.size(0) == num_reqs)
+          << "2D block_table first dim must be num_reqs=" << num_reqs
+          << ", got " << block_table.size(0);
+      block_table_mode = 2;
+      block_table_num_reqs = block_table.size(0);
+      block_table_num_blocks = static_cast<uint32_t>(block_table.size(1));
+      block_table_stride_t = static_cast<uint64_t>(block_table.stride(0));
+      block_table_stride_h = 0;
+      block_table_stride_k = static_cast<uint64_t>(block_table.stride(1));
+    }
+  }
+
+  if (maybe_seq_lens.has_value()) {
+    TensorView seq_lens = maybe_seq_lens.value();
+    CHECK_INPUT(seq_lens);
+    CHECK_DIM(1, seq_lens);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(seq_lens.dtype()) == int32_code)
+        << "seq_lens must be int32";
+    TVM_FFI_ICHECK(block_table_mode == 2)
+        << "seq_lens may only be passed with a 2D block_table";
+    TVM_FFI_ICHECK(seq_lens.size(0) == block_table_num_reqs)
+        << "seq_lens length must match block_table num_reqs=" << block_table_num_reqs
+        << ", got " << seq_lens.size(0);
+    CHECK_DEVICE(seq_lens, max_score);
+    seq_lens_ptr = TensorDataPtrConst<int32_t>(seq_lens);
   }
 
   const int32_t* num_valid_pages_per_token = nullptr;
@@ -135,12 +182,17 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       TensorDataPtr<int32_t>(output_indices),
       workspace_ptr,
       block_table_ptr,
+      seq_lens_ptr,
       static_cast<uint64_t>(output_indices.stride(0)),
       static_cast<uint64_t>(output_indices.stride(1)),
       static_cast<uint64_t>(output_indices.stride(2)),
       block_table_stride_t,
       block_table_stride_h,
       block_table_stride_k,
+      block_table_mode,
+      block_table_num_blocks,
+      static_cast<uint32_t>(block_size),
+      static_cast<uint32_t>(decode_query_len),
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       num_valid_pages_per_token, layout,

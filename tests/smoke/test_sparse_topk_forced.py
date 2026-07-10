@@ -21,6 +21,47 @@ def _gather_expected_from_block_table(logical_indices, block_table):
     return torch.where(logical_indices >= 0, gathered, torch.full_like(gathered, -1))
 
 
+def _build_expected_flat_block_table(
+    logical_indices, block_table, seq_lens, block_size, decode_query_len
+):
+    """Reference for the original Triton flat block-table transform."""
+    logical_cpu = logical_indices.cpu()
+    block_table_cpu = block_table.cpu()
+    seq_lens_cpu = seq_lens.cpu()
+    total_qo_len, num_kv_heads, topk = logical_cpu.shape
+    expected = torch.empty_like(logical_cpu)
+
+    for t in range(total_qo_len):
+        req = t // decode_query_len
+        q_off = t - req * decode_query_len
+        query_pos = max(int(seq_lens_cpu[req]) - decode_query_len + q_off, 0)
+        local_block = query_pos // block_size
+        for h in range(num_kv_heads):
+            valid_pages = []
+            local_page = None
+            for blk in logical_cpu[t, h].tolist():
+                if blk < 0:
+                    continue
+                effective_page = int(block_table_cpu[req, blk]) * num_kv_heads + h
+                if blk == local_block:
+                    local_page = effective_page
+                else:
+                    valid_pages.append(effective_page)
+
+            first_page = (
+                int(block_table_cpu[req, logical_cpu[t, h, 0]]) * num_kv_heads + h
+                if logical_cpu[t, h, 0] >= 0
+                else 0
+            )
+            if local_page is not None:
+                valid_pages.append(local_page)
+            expected[t, h] = torch.tensor(
+                valid_pages + [first_page] * (topk - len(valid_pages)), dtype=torch.int32
+            )
+
+    return expected.to(logical_indices.device)
+
+
 def test_block_table_gather_after_sort(
     num_qo_heads=3, max_k_tiles=96, total_qo_len=7,
     topk=16, num_valid_pages=73, seed=202,
@@ -87,6 +128,48 @@ def test_block_table_gather_identity_path(
     expected[:, :, :num_valid_pages] = block_table[:, :, :num_valid_pages]
     assert torch.equal(result, expected)
     print("  [PASS] block_table gather works on identity-fill path")
+
+
+def test_trtllm_flat_block_table_transform(
+    num_qo_heads=3, max_k_tiles=64, total_qo_len=8,
+    topk=16, decode_query_len=4, block_size=4, seed=404,
+):
+    """2D page table matches local-last compaction and padding semantics."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+    num_reqs = total_qo_len // decode_query_len
+    per_req_valid_pages = torch.tensor([64, 10], device=dev, dtype=torch.int32)
+    num_valid_pages = per_req_valid_pages.repeat_interleave(decode_query_len)
+    seq_lens = per_req_valid_pages * block_size
+
+    max_score = torch.randn(
+        total_qo_len, num_qo_heads, max_k_tiles, device=dev, dtype=torch.float32
+    )
+    k = torch.arange(max_k_tiles, device=dev).view(1, 1, -1)
+    max_score.masked_fill_(k >= num_valid_pages.view(-1, 1, 1), float("-inf"))
+
+    req = torch.arange(num_reqs, device=dev, dtype=torch.int32).view(-1, 1)
+    blk = torch.arange(max_k_tiles, device=dev, dtype=torch.int32).view(1, -1)
+    block_table = (10_000 * req + 3 * (max_k_tiles - 1 - blk) + 7).contiguous()
+
+    logical = sparse_topk_select(
+        max_score, topk, num_valid_pages=num_valid_pages,
+        force_end_blocks=1, max_score_layout="THK",
+    )
+    flat = sparse_topk_select(
+        max_score, topk, num_valid_pages=num_valid_pages,
+        force_end_blocks=1, max_score_layout="THK",
+        block_table=block_table, seq_lens=seq_lens,
+        block_size=block_size, decode_query_len=decode_query_len,
+    )
+    expected = _build_expected_flat_block_table(
+        logical, block_table, seq_lens, block_size, decode_query_len
+    )
+    assert torch.equal(flat, expected)
+    assert torch.all(flat[decode_query_len:] >= 0), (
+        "padding slots must be filled with a valid effective page instead of -1"
+    )
+    print("  [PASS] TRTLLM flat block table: gather, head fold, local-last, and padding")
 
 
 def test_forced_blocks(
@@ -259,6 +342,7 @@ if __name__ == "__main__":
     print("=== Testing forced block selection ===")
     test_block_table_gather_after_sort()
     test_block_table_gather_identity_path()
+    test_trtllm_flat_block_table_transform()
     test_forced_zero_is_noop()
     test_forced_blocks()
     test_forced_blocks(force_begin=1, force_end=0, seed=10)

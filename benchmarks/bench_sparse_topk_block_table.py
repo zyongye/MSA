@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""Benchmark sparse_topk_select with and without block_table gather.
+"""Benchmark sparse_topk_select with and without TRTLLM block-table flattening.
 
 The THK layout measures IndexerTopKWithSortKernel directly.  HKT includes the
 transpose stage and is useful for end-to-end API timing.
@@ -32,11 +32,50 @@ def _make_scores(total_qo_len, num_qo_heads, max_k_tiles, num_valid_pages, layou
     return scores_thk.permute(1, 2, 0).contiguous()
 
 
-def _make_block_table(total_qo_len, num_qo_heads, max_k_tiles, device):
-    t = torch.arange(total_qo_len, device=device, dtype=torch.int32).view(-1, 1, 1)
-    h = torch.arange(num_qo_heads, device=device, dtype=torch.int32).view(1, -1, 1)
-    k = torch.arange(max_k_tiles, device=device, dtype=torch.int32).view(1, 1, -1)
-    return (t * 1_000_000 + h * 10_000 + (max_k_tiles - 1 - k)).contiguous()
+def _make_block_table(total_qo_len, max_k_tiles, decode_query_len, block_size, device):
+    num_reqs = total_qo_len // decode_query_len
+    req = torch.arange(num_reqs, device=device, dtype=torch.int32).view(-1, 1)
+    blk = torch.arange(max_k_tiles, device=device, dtype=torch.int32).view(1, -1)
+    block_table = (req * max_k_tiles + (max_k_tiles - 1 - blk)).contiguous()
+    seq_lens = torch.full(
+        (num_reqs,), max_k_tiles * block_size, device=device, dtype=torch.int32
+    )
+    return block_table, seq_lens
+
+
+def _expected_flat_block_table(
+    logical_indices, block_table, seq_lens, block_size, decode_query_len
+):
+    logical_cpu = logical_indices.cpu()
+    block_table_cpu = block_table.cpu()
+    seq_lens_cpu = seq_lens.cpu()
+    total_qo_len, num_kv_heads, topk = logical_cpu.shape
+    expected = torch.empty_like(logical_cpu)
+    for t in range(total_qo_len):
+        req = t // decode_query_len
+        q_off = t - req * decode_query_len
+        query_pos = max(int(seq_lens_cpu[req]) - decode_query_len + q_off, 0)
+        local_block = query_pos // block_size
+        for h in range(num_kv_heads):
+            pages = []
+            local_page = None
+            first_page = 0
+            for blk in logical_cpu[t, h].tolist():
+                if blk < 0:
+                    continue
+                page = int(block_table_cpu[req, blk]) * num_kv_heads + h
+                if not pages and local_page is None:
+                    first_page = page
+                if blk == local_block:
+                    local_page = page
+                else:
+                    pages.append(page)
+            if local_page is not None:
+                pages.append(local_page)
+            expected[t, h] = torch.tensor(
+                pages + [first_page] * (topk - len(pages)), dtype=torch.int32
+            )
+    return expected.to(logical_indices.device)
 
 
 def _summarize(samples):
@@ -50,8 +89,9 @@ def run_case(args, layout):
         args.total_qo_len, args.num_qo_heads, args.max_k_tiles,
         args.num_valid_pages, layout, device,
     )
-    block_table = _make_block_table(
-        args.total_qo_len, args.num_qo_heads, args.max_k_tiles, device,
+    block_table, seq_lens = _make_block_table(
+        args.total_qo_len, args.max_k_tiles, args.decode_query_len,
+        args.block_size, device,
     )
     out_orig = torch.empty(
         args.total_qo_len, args.num_qo_heads, args.topk, device=device, dtype=torch.int32
@@ -61,22 +101,26 @@ def run_case(args, layout):
     def original():
         sparse_topk_select(
             scores, args.topk, num_valid_pages=args.num_valid_pages,
+            force_end_blocks=args.force_end_blocks,
             output=out_orig, max_score_layout=layout,
         )
 
     def with_block_table():
         sparse_topk_select(
             scores, args.topk, num_valid_pages=args.num_valid_pages,
-            output=out_gather, max_score_layout=layout, block_table=block_table,
+            force_end_blocks=args.force_end_blocks,
+            output=out_gather, max_score_layout=layout,
+            block_table=block_table, seq_lens=seq_lens,
+            block_size=args.block_size, decode_query_len=args.decode_query_len,
         )
 
     # Trigger JIT and validate that gather returns block-table values for the
     # exact logical selections produced by the original path.
     original()
     with_block_table()
-    safe = out_orig.clamp_min(0).to(torch.long)
-    expected = torch.gather(block_table, 2, safe)
-    expected = torch.where(out_orig >= 0, expected, torch.full_like(expected, -1))
+    expected = _expected_flat_block_table(
+        out_orig, block_table, seq_lens, args.block_size, args.decode_query_len
+    )
     if not torch.equal(out_gather, expected):
         raise RuntimeError(f"{layout}: block_table gather correctness check failed")
 
@@ -93,10 +137,10 @@ def run_case(args, layout):
     regression = (gather_ms / orig_ms - 1.0) * 100.0
 
     print(
-        f"{layout:>3} T={args.total_qo_len} H={args.num_qo_heads} K={args.max_k_tiles} "
-        f"topk={args.topk} nvp={args.num_valid_pages}: "
+        f"{layout:>3} T={args.total_qo_len} H={args.num_qo_heads} N={args.max_k_tiles} "
+        f"K={args.topk} nvp={args.num_valid_pages}: "
         f"orig={orig_ms:.4f} ms (std {orig_std:.4f}), "
-        f"block_table={gather_ms:.4f} ms (std {gather_std:.4f}), "
+        f"flat_block_table={gather_ms:.4f} ms (std {gather_std:.4f}), "
         f"regression={regression:+.2f}%"
     )
 
@@ -105,11 +149,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--layout", choices=("THK", "HKT", "both"), default="THK")
-    parser.add_argument("--total-qo-len", type=int, default=1024)
+    parser.add_argument("--total-qo-len", type=int, default=128)
     parser.add_argument("--num-qo-heads", type=int, default=8)
     parser.add_argument("--max-k-tiles", type=int, default=8192)
     parser.add_argument("--num-valid-pages", type=int, default=None)
     parser.add_argument("--topk", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--decode-query-len", type=int, default=1)
+    parser.add_argument("--force-end-blocks", type=int, default=1)
     parser.add_argument("--dry-run-ms", type=int, default=200)
     parser.add_argument("--repeat-ms", type=int, default=2000)
     parser.add_argument("--warm-l2", action="store_true")
@@ -124,6 +171,10 @@ def main():
         args.num_valid_pages = args.max_k_tiles
     if not (0 < args.num_valid_pages <= args.max_k_tiles):
         raise SystemExit("--num-valid-pages must be in (0, --max-k-tiles]")
+    if args.decode_query_len <= 0 or args.total_qo_len % args.decode_query_len != 0:
+        raise SystemExit("--decode-query-len must be positive and divide --total-qo-len")
+    if args.block_size <= 0:
+        raise SystemExit("--block-size must be positive")
 
     props = torch.cuda.get_device_properties(args.device)
     print(f"device=cuda:{args.device} {props.name}")

@@ -1216,6 +1216,9 @@ def sparse_topk_select(
     force_end_blocks: int = 0,
     max_score_layout: str = "HKT",
     block_table: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    block_size: int = 0,
+    decode_query_len: int = 0,
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1254,18 +1257,32 @@ def sparse_topk_select(
         nvp-N..nvp-1, closest to the current query) to always include.  Useful
         for local-window attention.  Default 0.
     block_table : torch.Tensor, optional
-        Optional int32 tensor with shape ``(total_qo_len, num_qo_heads, max_k_tiles)``.
-        The kernel still selects and sorts logical tile indices, but after sorting
-        each logical index ``idx`` is replaced with ``block_table[t, h, idx]`` in
-        the output.  Use this for per-token/per-head physical page-table gathers.
+        Optional int32 tensor.  A 3D tensor with shape
+        ``(total_qo_len, num_qo_heads, max_k_tiles)`` enables direct gather mode:
+        after sorting, each logical index ``idx`` is replaced with
+        ``block_table[t, h, idx]``.  A 2D tensor with shape
+        ``(num_reqs, max_blocks)`` enables TRTLLM flat mode and requires
+        ``seq_lens``, ``block_size``, and ``decode_query_len``.  In that mode,
+        each valid selected block becomes ``block_table[req, idx] * num_qo_heads + h``;
+        the local block is moved to the last valid slot, and padding slots are
+        filled with any valid page.
+    seq_lens : torch.Tensor, optional
+        CUDA int32/int64 request sequence lengths, shape ``(num_reqs,)``.  Required
+        when ``block_table`` is 2D.
+    block_size : int
+        KV page/block size in tokens.  Required when ``block_table`` is 2D.
+    decode_query_len : int
+        Number of query tokens per request in the flattened token dimension.
+        Required when ``block_table`` is 2D.
 
     Returns
     -------
     torch.Tensor
         Shape ``(total_qo_len, num_qo_heads, topk)``, int32.  Without
         ``block_table``, values are logical tile indices in ascending tile order.
-        With ``block_table``, values are gathered block-table entries after that
-        logical ascending sort.  Out-of-range entries (if any) are ``-1`` at the tail.
+        With 3D ``block_table``, values are gathered block-table entries after
+        that logical ascending sort.  With 2D ``block_table``, values are TRTLLM
+        flat effective pages and padding slots are valid fill pages.
     """
 
     assert max_score.dtype == torch.float32, f"max_score must be float32, got {max_score.dtype}"
@@ -1284,6 +1301,8 @@ def sparse_topk_select(
         total_qo_len, num_qo_heads, max_k_tiles = max_score.shape
         layout_arg = 1
 
+    seq_lens_arg = None
+    block_table_mode = 0
     if block_table is not None:
         assert block_table.dtype == torch.int32, (
             f"block_table must be int32, got {block_table.dtype}"
@@ -1291,17 +1310,57 @@ def sparse_topk_select(
         assert block_table.device == max_score.device, (
             f"block_table must be on {max_score.device}, got {block_table.device}"
         )
-        assert block_table.dim() == 3, (
-            f"block_table must be 3D [total_qo_len, num_qo_heads, max_k_tiles], "
-            f"got {tuple(block_table.shape)}"
-        )
-        assert tuple(block_table.shape) == (total_qo_len, num_qo_heads, max_k_tiles), (
-            f"block_table shape must be {(total_qo_len, num_qo_heads, max_k_tiles)}, "
+        assert block_table.dim() in (2, 3), (
+            f"block_table must be 2D [num_reqs, max_blocks] or "
+            f"3D [total_qo_len, num_qo_heads, max_k_tiles], "
             f"got {tuple(block_table.shape)}"
         )
         assert all(s >= 0 for s in block_table.stride()), (
             f"block_table must have non-negative strides, got {block_table.stride()}"
         )
+        if block_table.dim() == 3:
+            block_table_mode = 1
+            assert seq_lens is None, "seq_lens may only be used with a 2D block_table"
+            assert tuple(block_table.shape) == (total_qo_len, num_qo_heads, max_k_tiles), (
+                f"3D block_table shape must be {(total_qo_len, num_qo_heads, max_k_tiles)}, "
+                f"got {tuple(block_table.shape)}"
+            )
+        else:
+            block_table_mode = 2
+            assert seq_lens is not None, "seq_lens is required with a 2D block_table"
+            assert block_size > 0, f"block_size must be > 0 with a 2D block_table, got {block_size}"
+            assert decode_query_len > 0, (
+                f"decode_query_len must be > 0 with a 2D block_table, got {decode_query_len}"
+            )
+            assert total_qo_len % decode_query_len == 0, (
+                f"total_qo_len={total_qo_len} must be divisible by "
+                f"decode_query_len={decode_query_len}"
+            )
+            num_reqs = total_qo_len // decode_query_len
+            assert block_table.shape[0] == num_reqs, (
+                f"2D block_table first dim must be num_reqs={num_reqs}, "
+                f"got {block_table.shape[0]}"
+            )
+            if isinstance(num_valid_pages, int):
+                assert block_table.shape[1] >= int(num_valid_pages), (
+                    f"2D block_table max_blocks={block_table.shape[1]} must be >= "
+                    f"num_valid_pages={num_valid_pages}"
+                )
+            assert seq_lens.dim() == 1, (
+                f"seq_lens must be 1D [num_reqs], got {tuple(seq_lens.shape)}"
+            )
+            assert seq_lens.shape[0] == num_reqs, (
+                f"seq_lens length must be num_reqs={num_reqs}, got {seq_lens.shape[0]}"
+            )
+            assert seq_lens.device == max_score.device, (
+                f"seq_lens must be on {max_score.device}, got {seq_lens.device}"
+            )
+            assert seq_lens.dtype in (torch.int32, torch.int64), (
+                f"seq_lens must be int32 or int64, got {seq_lens.dtype}"
+            )
+            seq_lens_arg = seq_lens.to(dtype=torch.int32).contiguous()
+    else:
+        assert seq_lens is None, "seq_lens requires block_table"
 
     # v2.3 kernel only supports the insertion-sort path (K < 12288).
     assert max_k_tiles < 12288, (
@@ -1383,13 +1442,15 @@ def sparse_topk_select(
     # post-process torch.where + sort + torch.where chain (~84-101 us / call)
     # is replaced by passing num_valid_pages directly to the kernel.
     module.sparse_topk_select(
-        max_score, output_indices, workspace_buffer, block_table,
+        max_score, output_indices, workspace_buffer, block_table, seq_lens_arg,
         topk,
         nvp_arg,
         nvp_tensor,
         int(force_begin_blocks),
         int(force_end_blocks),
         layout_arg,
+        int(block_size) if block_table_mode == 2 else 0,
+        int(decode_query_len) if block_table_mode == 2 else 0,
         torch.cuda.current_stream().cuda_stream,
     )
 
